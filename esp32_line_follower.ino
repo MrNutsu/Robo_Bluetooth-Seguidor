@@ -1,27 +1,16 @@
 /**
- * @file esp32_line_follower.ino
- * @author Your Name
- * @brief Firmware for an ESP32-based line-following robot with Bluetooth manual control and PID tuning.
- * @version 2.6 - Corrected Sensor Pinout Order
- * @date 2024-06-11
+ * @file esp32_line_follower_auto_bluetooth.ino
+ * @author Modificado para controle automático via Bluetooth
+ * @brief Firmware para robô seguidor de linha ESP32 com controle automático Bluetooth
+ * @version 3.1 - Auto modo baseado em conexão Bluetooth
+ * @date 2024-06-13
  *
  * @details
- * This code controls a two-wheeled robot designed to follow a black line on a white surface.
- * It features:
- * - QTR-5-RC reflectance sensor array for line detection.
- * - L298N-style motor driver for differential drive.
- * - Bluetooth serial communication for mode switching, manual control, and live PID tuning.
- * - A PID (Proportional-Integral-Derivative) controller for smooth line following.
- * - An automatic sensor calibration routine on startup.
- *
- * --- Bluetooth Commands (Simplified) ---
- * - 'L': Toggles line-following mode ON/OFF.
- * - 'F', 'B', 'R', 'L', 'G', 'I', 'H', 'J': Movement commands. Automatically switches to Manual Mode.
- * - 'S': Stops the robot (in Manual Mode).
- * - '0'-'9', 'q': Adjust speed (in Manual Mode).
- * - PID Tuning (when in line-following mode):
- * The robot expects two bytes. The first identifies the parameter, the second is the value.
- * 1: Set Kp, 2: Set Kp multiplier, 3: Set Ki, 4: Set Ki multiplier, 5: Set Kd, 6: Set Kd multiplier
+ * NOVA FUNCIONALIDADE:
+ * - Ativa seguidor de linha automaticamente quando Bluetooth desconectado
+ * - Desativa seguidor quando Bluetooth conecta
+ * - Mantém todas as funcionalidades anteriores
+ * - Indicação visual via LED do status da conexão
  */
 
 #include <QTRSensors.h>
@@ -32,7 +21,6 @@
 #error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
 #endif
 
-// Define the built-in LED pin for ESP32 (usually GPIO 2)
 #define LED_BUILTIN 2
 
 // =================== PIN DEFINITIONS ===================
@@ -46,15 +34,14 @@ const int MOTOR_B_IN1 = 33;
 const int MOTOR_B_IN2 = 25;
 const int MOTOR_B_EN = 32;
 
-// QTR Reflectance Sensors
-const uint8_t SENSOR_COUNT = 5;
-// CRITICAL FIX: Updated with the correct pin order provided by the user.
-// Sensor 1 -> PIN 34 (Array index 0)
-// Sensor 2 -> PIN 35 (Array index 1)
-// Sensor 3 -> PIN 18 (Array index 2)
-// Sensor 4 -> PIN 19 (Array index 3)
-// Sensor 5 -> PIN 21 (Array index 4)
-const uint8_t SENSOR_PINS[SENSOR_COUNT] = {34, 35, 18, 19, 21}; 
+// QTR Reflectance Sensors - CORRIGIDO PARA 4 SENSORES
+const uint8_t SENSOR_COUNT = 4;
+// Removido GPIO 32 (sensor 2 defeituoso)
+// Sensor 1 -> GPIO 34 (índice 0)
+// Sensor 3 -> GPIO 18 (índice 1) 
+// Sensor 4 -> GPIO 19 (índice 2)
+// Sensor 5 -> GPIO 21 (índice 3)
+const uint8_t SENSOR_PINS[SENSOR_COUNT] = {34, 18, 19, 21}; 
 
 // =================== GLOBAL OBJECTS & VARIABLES ===================
 QTRSensors qtr;
@@ -64,33 +51,46 @@ BluetoothSerial SerialBT;
 enum RobotState { IDLE, MANUAL_CONTROL, LINE_FOLLOWING_ACTIVE };
 RobotState currentState = IDLE;
 
-// Line Following & PID Control
-float Kp = 1.0;
-float Ki = 0.0;
-float Kd = 0.1;
+// NOVA VARIÁVEL: Controle de conexão Bluetooth
+bool bluetoothConnected = false;
+bool lastBluetoothState = false;
+unsigned long lastConnectionCheck = 0;
+const unsigned long CONNECTION_CHECK_INTERVAL = 1000; // Verificar a cada 1 segundo
 
-// Multipliers allow adjusting PID constants by powers of 10 via Bluetooth
+// Line Following & PID Control - VALORES CORRIGIDOS
+float Kp = 0.8;        // Reduzido para evitar oscilação
+float Ki = 0.0;        // Começar sem integral
+float Kd = 0.15;       // Aumentado para melhor estabilidade
+
 uint8_t Kp_multiplier = 1;
 uint8_t Ki_multiplier = 1;
 uint8_t Kd_multiplier = 1;
 
 int lastError = 0;
 float integral = 0;
-const float INTEGRAL_LIMIT = 4000; // Anti-windup limit
+const float INTEGRAL_LIMIT = 2000; // Reduzido para 4 sensores
 
-int baseSpeed = 200;
+int baseSpeed = 178;   // 70% da potência total 
+const int SEARCH_SPEED = 143; // 70% da potência para procurar linha
 
 // Manual Control
-char manualCommand = 'S'; // Default to Stop
+char manualCommand = 'S';
 int manualSpeed = 200;
 const int MAX_SPEED = 255;
 
 // PID Tuning via Bluetooth
 int bt_value, bt_cmd_counter = 0, bt_cmd_buffer[3];
 
+// Controle de linha perdida
+unsigned long lineLastSeen = 0;
+const unsigned long LINE_LOST_TIMEOUT = 1000; // 1 segundo
+int lastValidPosition = 1500; // Centro para 4 sensores
+
 // =================== FUNCTION PROTOTYPES ===================
 void setup();
 void loop();
+void checkBluetoothConnection();
+void handleBluetoothConnectionChange();
 void handleBluetooth();
 void processPidTuningCommand();
 void lineFollowController();
@@ -106,11 +106,12 @@ void moveForwardLeft(int speed);
 void moveBackwardRight(int speed);
 void moveBackwardLeft(int speed);
 void stopMotors();
+void printSensorDebug(uint16_t* sensors, uint16_t position);
 
 // =================== SETUP ===================
 void setup() {
   Serial.begin(115200);
-  Serial.println("Initializing Line Follower Robot...");
+  Serial.println("=== ESP32 Line Follower - Auto Bluetooth Mode ===");
 
   // Configure motor driver pins
   pinMode(MOTOR_A_IN1, OUTPUT);
@@ -120,54 +121,93 @@ void setup() {
   pinMode(MOTOR_A_EN, OUTPUT);
   pinMode(MOTOR_B_EN, OUTPUT);
 
-  // Configure QTR sensors
-  qtr.setTypeAnalog();
+  // CORREÇÃO CRÍTICA: Configure QTR sensors como RC (não Analog)
+  qtr.setTypeRC();
   qtr.setSensorPins(SENSOR_PINS, SENSOR_COUNT);
+  qtr.setEmitterPin(2); // LED IR no GPIO 2
 
   // Start Bluetooth Serial
-  SerialBT.begin("ESP32_LineFollower");
-  Serial.println("Bluetooth started. Waiting for connection...");
+  SerialBT.begin("ESP32_LineFollower_4S");
+  Serial.println("Bluetooth iniciado: ESP32_LineFollower_4S");
 
-  // Calibrate sensors
+  // Configure LED for Bluetooth status indication
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
-  Serial.println("Calibrating sensors... Move robot over the line for 10 seconds.");
+  
+  Serial.println("=== CALIBRAÇÃO DOS SENSORES ===");
+  Serial.println("Mova o robô sobre a linha por 10 segundos...");
+  Serial.println("3... 2... 1... COMEÇOU!");
 
   for (uint16_t i = 0; i < 400; i++) {
     qtr.calibrate();
-    delay(20);
+    
+    // Mostrar progresso
+    if (i % 50 == 0) {
+      Serial.print("Progresso: ");
+      Serial.print((i * 100) / 400);
+      Serial.println("%");
+    }
+    delay(25);
   }
 
   digitalWrite(LED_BUILTIN, LOW);
-  Serial.println("Calibration complete!");
+  Serial.println("Calibração completa!");
 
   // Print calibration data for debugging
-  Serial.println("--- Sensor Calibration Results ---");
+  Serial.println("=== RESULTADOS DA CALIBRAÇÃO ===");
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
     Serial.print("Sensor ");
-    Serial.print(i);
+    Serial.print(i + 1);
     Serial.print(" (GPIO ");
     Serial.print(SENSOR_PINS[i]);
     Serial.print(") min: ");
     Serial.print(qtr.calibrationOn.minimum[i]);
     Serial.print(" max: ");
-    Serial.println(qtr.calibrationOn.maximum[i]);
+    Serial.print(qtr.calibrationOn.maximum[i]);
+    
+    // Verificar se calibração foi bem-sucedida
+    int range = qtr.calibrationOn.maximum[i] - qtr.calibrationOn.minimum[i];
+    if (range < 200) {
+      Serial.print(" ⚠️ AVISO: Range baixo!");
+    } else {
+      Serial.print(" ✅ OK");
+    }
+    Serial.println();
   }
-  Serial.println("--------------------------------");
+  Serial.println("=====================================");
 
   // Start in IDLE state
   stopMotors();
   currentState = IDLE;
-  Serial.println("\nRobot is ready!");
-  Serial.println("Bluetooth Commands: L=Toggle Line Follow, F/B/R/L..=Move, S=Stop");
+  lineLastSeen = millis();
+  
+  // Inicializar estado do Bluetooth
+  bluetoothConnected = SerialBT.hasClient();
+  lastBluetoothState = bluetoothConnected;
+  
+  Serial.println("🤖 Robô pronto!");
+  Serial.println("🔄 MODO AUTOMÁTICO ATIVADO:");
+  Serial.println("   • Sem Bluetooth = Seguidor de linha ON");
+  Serial.println("   • Com Bluetooth = Controle manual disponível");
+  Serial.println("Comandos Bluetooth: L=Toggle Linha, F/B/R/L=Mover, S=Parar");
+  Serial.println("Valores PID atuais:");
+  Serial.println("Kp=" + String(Kp) + " Ki=" + String(Ki) + " Kd=" + String(Kd));
+  
+  // Verificar estado inicial e ativar modo apropriado
+  handleBluetoothConnectionChange();
 }
 
 // =================== MAIN LOOP ===================
 void loop() {
-  // Always listen for new commands
-  handleBluetooth();
+  // Verificar conexão Bluetooth periodicamente
+  checkBluetoothConnection();
+  
+  // Processar comandos Bluetooth se conectado
+  if (bluetoothConnected) {
+    handleBluetooth();
+  }
 
-  // State machine for robot control
+  // Executar ação baseada no estado atual
   switch (currentState) {
     case LINE_FOLLOWING_ACTIVE:
       lineFollowController();
@@ -183,57 +223,93 @@ void loop() {
       break;
   }
 
-  delay(10); // Small delay for stability
+  delay(10);
 }
 
-// =================== BLUETOOTH HANDLING (SIMPLIFIED) ===================
+// =================== BLUETOOTH CONNECTION MANAGEMENT ===================
+void checkBluetoothConnection() {
+  if (millis() - lastConnectionCheck > CONNECTION_CHECK_INTERVAL) {
+    bluetoothConnected = SerialBT.hasClient();
+    
+    // Verificar se houve mudança no status de conexão
+    if (bluetoothConnected != lastBluetoothState) {
+      handleBluetoothConnectionChange();
+      lastBluetoothState = bluetoothConnected;
+    }
+    
+    lastConnectionCheck = millis();
+  }
+}
+
+void handleBluetoothConnectionChange() {
+  if (bluetoothConnected) {
+    // Bluetooth conectado - parar seguidor automático
+    Serial.println("📱 BLUETOOTH CONECTADO!");
+    Serial.println("🛑 Seguidor automático DESATIVADO");
+    Serial.println("🎮 Controle manual disponível");
+    
+    currentState = IDLE;
+    stopMotors();
+    digitalWrite(LED_BUILTIN, HIGH); // LED aceso = Bluetooth conectado
+    
+    SerialBT.println("=== CONECTADO ===");
+    SerialBT.println("Seguidor AUTO OFF");
+    SerialBT.println("Comandos: L=Toggle, F/B/R/L=Mover, S=Parar");
+    
+  } else {
+    // Bluetooth desconectado - ativar seguidor automático
+    Serial.println("📱 BLUETOOTH DESCONECTADO!");
+    Serial.println("🚀 Seguidor automático ATIVADO");
+    
+    currentState = LINE_FOLLOWING_ACTIVE;
+    lastError = 0;
+    integral = 0;
+    lineLastSeen = millis();
+    lastValidPosition = 1500;
+    digitalWrite(LED_BUILTIN, LOW); // LED apagado = Bluetooth desconectado
+  }
+}
+
+// =================== BLUETOOTH HANDLING ===================
 void handleBluetooth() {
   if (SerialBT.available()) {
     char command = SerialBT.read();
-    Serial.print("Received command: ");
+    Serial.print("Comando recebido: ");
     Serial.println(command);
 
-    // --- High Priority Commands (Mode Switching & Manual Control) ---
-
-    // 'L' toggles Line Following mode
     if (command == 'L') { 
       if (currentState == LINE_FOLLOWING_ACTIVE) {
-        currentState = IDLE; // Go to idle when stopping line follower
-        Serial.println("Line Following STOPPED");
-        SerialBT.println("Line Following OFF");
+        currentState = IDLE;
+        Serial.println("🛑 Seguidor de linha PARADO (manual)");
+        SerialBT.println("Seguidor OFF");
       } else {
         currentState = LINE_FOLLOWING_ACTIVE;
-        lastError = 0; // Reset PID state
+        lastError = 0;
         integral = 0;
-        Serial.println("Line Following STARTED");
-        SerialBT.println("Line Following ON");
+        lineLastSeen = millis();
+        lastValidPosition = 1500; // Centro para 4 sensores
+        Serial.println("🚀 Seguidor de linha ATIVADO (manual)");
+        SerialBT.println("Seguidor ON");
       }
-      return; // Command processed
+      return;
     }
 
-    // Any movement command (including Stop) automatically engages Manual Control mode
     if (strchr("FBLRGIJHS", command)) { 
-      // If we weren't in manual mode, announce the change.
       if (currentState != MANUAL_CONTROL) {
-        Serial.println("Switched to MANUAL mode");
-        SerialBT.println("Manual Control ON");
+        Serial.println("🎮 Modo MANUAL ativado");
+        SerialBT.println("Controle Manual ON");
       }
       currentState = MANUAL_CONTROL;
       manualCommand = command;
-      return; // Command processed
+      return;
     }
     
-    // --- Context-Sensitive Commands ---
-
-    // Speed commands are only valid in manual mode
     if (currentState == MANUAL_CONTROL && strchr("0123456789q", command)) {
       adjustSpeedFromBT(command);
-      return; // Command processed
+      return;
     }
 
-    // PID tuning commands are only valid in line-following mode
     if (currentState == LINE_FOLLOWING_ACTIVE) {
-      // Process PID tuning commands
       bt_value = command;
       bt_cmd_counter++;
       bt_cmd_buffer[bt_cmd_counter] = bt_value;
@@ -241,72 +317,142 @@ void handleBluetooth() {
         bt_cmd_counter = 0;
         processPidTuningCommand();
       }
-      return; // Command processed
+      return;
     }
   }
 }
 
-
-// =================== PID TUNING PROCESSING ===================
+// =================== PID TUNING ===================
 void processPidTuningCommand() {
   int param_id = bt_cmd_buffer[1];
   int param_val = bt_cmd_buffer[2];
 
   switch (param_id) {
-    case 1: Kp = param_val; Serial.print("Set Kp = "); Serial.println(Kp); break;
-    case 2: Kp_multiplier = param_val; Serial.print("Set Kp_multiplier = "); Serial.println(Kp_multiplier); break;
-    case 3: Ki = param_val; Serial.print("Set Ki = "); Serial.println(Ki); break;
-    case 4: Ki_multiplier = param_val; Serial.print("Set Ki_multiplier = "); Serial.println(Ki_multiplier); break;
-    case 5: Kd = param_val; Serial.print("Set Kd = "); Serial.println(Kd); break;
-    case 6: Kd_multiplier = param_val; Serial.print("Set Kd_multiplier = "); Serial.println(Kd_multiplier); break;
-    default: Serial.println("Unknown PID parameter ID"); break;
+    case 1: 
+      Kp = param_val; 
+      Serial.println("Kp = " + String(Kp));
+      SerialBT.println("Kp=" + String(Kp));
+      break;
+    case 2: 
+      Kp_multiplier = param_val; 
+      Serial.println("Kp_mult = " + String(Kp_multiplier));
+      break;
+    case 3: 
+      Ki = param_val; 
+      Serial.println("Ki = " + String(Ki));
+      SerialBT.println("Ki=" + String(Ki));
+      break;
+    case 4: 
+      Ki_multiplier = param_val; 
+      Serial.println("Ki_mult = " + String(Ki_multiplier));
+      break;
+    case 5: 
+      Kd = param_val; 
+      Serial.println("Kd = " + String(Kd));
+      SerialBT.println("Kd=" + String(Kd));
+      break;
+    case 6: 
+      Kd_multiplier = param_val; 
+      Serial.println("Kd_mult = " + String(Kd_multiplier));
+      break;
+    default: 
+      Serial.println("❌ ID de parâmetro PID inválido");
+      break;
   }
 }
 
-// =================== LINE FOLLOWING CONTROLLER ===================
+// =================== LINE FOLLOWING CONTROLLER - CORRIGIDO ===================
 void lineFollowController() {
   uint16_t sensorValues[SENSOR_COUNT];
-  // The line position is returned as a value from 0 to 4000 for 5 sensors.
+  
+  // CORREÇÃO: Para 4 sensores, posição vai de 0 a 3000
   uint16_t position = qtr.readLineBlack(sensorValues);
-
-  // More robust line-lost check: The library returns 0 or 4000 when the line is not seen.
-  bool lineLost = (position == 0 || position == 4000);
-
-  if (lineLost) {
-    // If we lose the line, pivot in the direction of the last known error.
-    if (lastError > 0) { // Was last seen to the right (position > 2000)
-      motorDrive(baseSpeed, -baseSpeed); // Pivot right to find it
-    } else { // Was last seen to the left (position < 2000) or was centered
-      motorDrive(-baseSpeed, baseSpeed); // Pivot left to find it
+  
+  // Debug dos sensores (descomente para diagnóstico)
+  // printSensorDebug(sensorValues, position);
+  
+  // Verificar se a linha está sendo vista
+  bool lineDetected = false;
+  int maxSensorValue = 0;
+  
+  for (int i = 0; i < SENSOR_COUNT; i++) {
+    if (sensorValues[i] > maxSensorValue) {
+      maxSensorValue = sensorValues[i];
     }
-    return;
+    if (sensorValues[i] > 300) { // Limiar para detectar linha
+      lineDetected = true;
+    }
   }
   
-  // PID calculation
-  int error = position - 2000;
+  if (lineDetected) {
+    lineLastSeen = millis();
+    lastValidPosition = position;
+    
+    // PID calculation - CORRIGIDO para 4 sensores
+    int error = position - 1500; // Centro é 1500 para 4 sensores (3000/2)
 
-  float proportional = error;
-  integral = integral + error;
-  float derivative = error - lastError;
-  lastError = error;
+    float proportional = error;
+    integral = integral + error;
+    float derivative = error - lastError;
+    lastError = error;
 
-  // Anti-windup: constrain the integral term
-  integral = constrain(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+    // Anti-windup
+    integral = constrain(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
 
-  float p_term = (Kp / pow(10, Kp_multiplier)) * proportional;
-  float i_term = (Ki / pow(10, Ki_multiplier)) * integral;
-  float d_term = (Kd / pow(10, Kd_multiplier)) * derivative;
+    // Aplicar multiplicadores PID
+    float p_term = (Kp / pow(10, Kp_multiplier)) * proportional;
+    float i_term = (Ki / pow(10, Ki_multiplier)) * integral;
+    float d_term = (Kd / pow(10, Kd_multiplier)) * derivative;
 
-  float pidValue = p_term + i_term + d_term;
+    float pidValue = p_term + i_term + d_term;
 
-  int leftSpeed = baseSpeed + pidValue;
-  int rightSpeed = baseSpeed - pidValue;
+    int leftSpeed = baseSpeed + pidValue;
+    int rightSpeed = baseSpeed - pidValue;
 
-  // Constrain motor speeds to valid PWM range
-  leftSpeed = constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
-  rightSpeed = constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
+    // Constrain motor speeds
+    leftSpeed = constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
+    rightSpeed = constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
 
-  motorDrive(leftSpeed, rightSpeed);
+    motorDrive(leftSpeed, rightSpeed);
+    
+    // Debug PID (descomente se necessário)
+    /*
+    Serial.print("Pos: "); Serial.print(position);
+    Serial.print(" Err: "); Serial.print(error);
+    Serial.print(" PID: "); Serial.print(pidValue);
+    Serial.print(" L: "); Serial.print(leftSpeed);
+    Serial.print(" R: "); Serial.println(rightSpeed);
+    */
+    
+  } else {
+    // LINHA PERDIDA - Algoritmo melhorado
+    unsigned long timeLost = millis() - lineLastSeen;
+    
+    if (timeLost < LINE_LOST_TIMEOUT) {
+      // Procurar linha baseado na última posição conhecida
+      if (lastValidPosition > 1500) {
+        // Linha estava à direita, virar à direita
+        motorDrive(SEARCH_SPEED, -SEARCH_SPEED);
+        Serial.println("🔍 Procurando linha à DIREITA");
+      } else {
+        // Linha estava à esquerda, virar à esquerda  
+        motorDrive(-SEARCH_SPEED, SEARCH_SPEED);
+        Serial.println("🔍 Procurando linha à ESQUERDA");
+      }
+    } else {
+      // Linha perdida há muito tempo, parar
+      stopMotors();
+      Serial.println("❌ LINHA PERDIDA! Parando...");
+      
+      // Se Bluetooth conectado, notificar
+      if (bluetoothConnected) {
+        SerialBT.println("Linha perdida!");
+      }
+      
+      // Opcional: voltar para modo IDLE
+      // currentState = IDLE;
+    }
+  }
 }
 
 // =================== MANUAL CONTROLLER ===================
@@ -341,49 +487,40 @@ void adjustSpeedFromBT(char cmd) {
     default: return;
   }
   manualSpeed = constrain(newSpeed, 0, MAX_SPEED);
-  Serial.print("Manual speed set to: ");
-  Serial.println(manualSpeed);
-  SerialBT.print("Speed: ");
-  SerialBT.println(manualSpeed);
+  Serial.println("Velocidade manual: " + String(manualSpeed));
+  SerialBT.println("Speed: " + String(manualSpeed));
 }
 
-// =================== MOTOR MOVEMENT FUNCTIONS ===================
-
-/**
- * @brief Controls both motors directly with explicit stop handling.
- * @param leftSpeed Speed for the left motor (-255 to 255).
- * @param rightSpeed Speed for the right motor (-255 to 255).
- */
+// =================== MOTOR FUNCTIONS ===================
 void motorDrive(int leftSpeed, int rightSpeed) {
-  // Constrain inputs to be safe
   leftSpeed = constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
   rightSpeed = constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
 
-  // --- Left Motor ---
-  if (leftSpeed > 0) { // Forward
+  // Left Motor
+  if (leftSpeed > 0) {
     digitalWrite(MOTOR_A_IN1, HIGH);
     digitalWrite(MOTOR_A_IN2, LOW);
     analogWrite(MOTOR_A_EN, leftSpeed);
-  } else if (leftSpeed < 0) { // Backward
+  } else if (leftSpeed < 0) {
     digitalWrite(MOTOR_A_IN1, LOW);
     digitalWrite(MOTOR_A_IN2, HIGH);
-    analogWrite(MOTOR_A_EN, -leftSpeed); // Use positive value for speed
-  } else { // Stop (coast)
+    analogWrite(MOTOR_A_EN, -leftSpeed);
+  } else {
     digitalWrite(MOTOR_A_IN1, LOW);
     digitalWrite(MOTOR_A_IN2, LOW);
     analogWrite(MOTOR_A_EN, 0);
   }
 
-  // --- Right Motor ---
-  if (rightSpeed > 0) { // Forward
+  // Right Motor
+  if (rightSpeed > 0) {
     digitalWrite(MOTOR_B_IN1, HIGH);
     digitalWrite(MOTOR_B_IN2, LOW);
     analogWrite(MOTOR_B_EN, rightSpeed);
-  } else if (rightSpeed < 0) { // Backward
+  } else if (rightSpeed < 0) {
     digitalWrite(MOTOR_B_IN1, LOW);
     digitalWrite(MOTOR_B_IN2, HIGH);
-    analogWrite(MOTOR_B_EN, -rightSpeed); // Use positive value for speed
-  } else { // Stop (coast)
+    analogWrite(MOTOR_B_EN, -rightSpeed);
+  } else {
     digitalWrite(MOTOR_B_IN1, LOW);
     digitalWrite(MOTOR_B_IN2, LOW);
     analogWrite(MOTOR_B_EN, 0);
@@ -399,3 +536,18 @@ void moveForwardRight(int speed) { motorDrive(speed, speed / 2); }
 void moveForwardLeft(int speed) { motorDrive(speed / 2, speed); }
 void moveBackwardRight(int speed) { motorDrive(-speed, -speed / 2); }
 void moveBackwardLeft(int speed) { motorDrive(-speed / 2, -speed); }
+
+// =================== DEBUG FUNCTION ===================
+void printSensorDebug(uint16_t* sensors, uint16_t position) {
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 500) { // Print a cada 500ms
+    Serial.print("Sensores: ");
+    for (int i = 0; i < SENSOR_COUNT; i++) {
+      Serial.print(sensors[i]);
+      Serial.print("\t");
+    }
+    Serial.print("Posição: ");
+    Serial.println(position);
+    lastPrint = millis();
+  }
+}
