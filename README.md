@@ -3,7 +3,7 @@
 Firmware para um robô seguidor de linha com controle **automático via PID** e **manual via Bluetooth**, desenvolvido com **ESP32**.
 
 <div align="center">
-  <img src="images/robot.jpg" alt="Robô Montado" width="400"/>
+  <img src="imagens/fa6767f8-d7d1-45d1-a0ea-44f311b96091.jfif" alt="Robô Montado" width="400"/>
   
 </div>
 
@@ -57,7 +57,7 @@ Envie **6 bytes sequenciais** para definir os valores de Kp, Ki e Kd:
 - Jumpers e protoboard
 
 <div align="center">
-  <img src="images/circuit.jpg" alt="Esquema do Circuito" width="400"/>
+  <img src="imagens/73c3dc94-f9ba-46df-b2e4-8f60a52000a3.png" alt="Esquema do Circuito" width="400"/>
 </div>
 
 ---
